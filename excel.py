@@ -2,153 +2,170 @@ import win32com.client
 import os
 import pandas as pd
 import tempfile
-from datetime import datetime
-import sys
+from datetime import datetime, time
 
-# --- STATIC CONFIGURATION ---
-TARGET_FOLDER_NAME = "Invoices"         # Folder in Outlook to search
-MASTER_FILE = "Master_IOC_Sheet.xlsx"   # The file to append data to
-IOC_COLUMNS = ['md5', 'sha1', 'sha256', 'ip'] # The headers we look for
+# --- CONFIGURATION ---
+TARGET_FOLDER_NAME = "cti"   
+MASTER_FILE = "Master_IOC_Sheet.xlsx"
+
+# UPDATED MAPPING: Matches your specific column names
+# Keys = Output Column Name
+# Values = What to look for in the Excel Header (Lowercase)
+IOC_SEARCH_TERMS = {
+    'md5': ['md-5', 'md5'],          # Matches "MD-5"
+    'sha1': ['sha-1', 'sha1'],        # Matches "SHA-1"
+    'sha256': ['sha-2', 'sha256'],    # Matches "SHA-2"
+    'ip': ['ip address', 'ip_address'] # Matches "IP Address"
+}
 
 def get_valid_date(prompt_text):
-    """Asks the user for a date and validates the format."""
     while True:
-        date_str = input(prompt_text).strip()
         try:
-            # Try to parse the string into a date object
-            valid_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            return valid_date
+            return datetime.strptime(input(prompt_text).strip(), "%Y-%m-%d").date()
         except ValueError:
-            print("❌ Invalid format. Please use YYYY-MM-DD (e.g., 2026-01-31).")
+            print("❌ Invalid format. Use YYYY-MM-DD.")
 
-def get_folder(base_folder, target_name):
-    """Recursively find a folder by name within Outlook."""
-    if base_folder.Name == target_name:
-        return base_folder
-    for folder in base_folder.Folders:
-        found = get_folder(folder, target_name)
-        if found: return found
+def find_header_row(df):
+    """
+    Scans the first 10 rows to find the row that contains your specific headers.
+    """
+    # Flatten keywords for easy searching
+    all_keywords = [item for sublist in IOC_SEARCH_TERMS.values() for item in sublist]
+
+    # 1. Check if the current columns already match
+    current_cols = [str(c).lower().strip() for c in df.columns]
+    if any(k in c for k in all_keywords for c in current_cols):
+        return df
+
+    # 2. Scan first 10 rows
+    for i, row in df.head(10).iterrows():
+        # Clean up the row data: lowercase, remove spaces
+        row_values = [str(val).lower().strip() for val in row.values]
+        
+        # Check if this row contains 'md-5', 'sha-2', or 'ip address'
+        if any(k in val for k in all_keywords for val in row_values):
+            print(f"      🔎 Found headers on Row {i+2} (Pandas index {i})")
+            
+            # Reset the dataframe to start from this row
+            df_new = df.iloc[i+1:].copy()
+            df_new.columns = row_values
+            return df_new
+            
     return None
 
-def process_outlook_emails():
-    # --- 1. USER INPUT ---
-    print("--- Outlook IOC Extractor ---")
-    start_date = get_valid_date("Enter Start Date (YYYY-MM-DD): ")
-    end_date = get_valid_date("Enter End Date   (YYYY-MM-DD): ")
+def process_cti_final_fixed():
+    print(f"--- Outlook CTI Processor (Final Fix) ---")
 
-    if start_date > end_date:
-        print("❌ Error: Start date cannot be after End date.")
-        return
-
-    # --- 2. CONNECT TO OUTLOOK ---
+    # 1. Connect
     try:
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        inbox = outlook.GetDefaultFolder(6) # 6 = Inbox
+        inbox = outlook.GetDefaultFolder(6)
+        target_folder = inbox.Folders(TARGET_FOLDER_NAME)
     except Exception as e:
-        print(f"❌ Could not connect to Outlook. Is it open? Error: {e}")
-        return
-    
-    target_folder = get_folder(inbox, TARGET_FOLDER_NAME)
-    if not target_folder:
-        print(f"❌ Error: Folder '{TARGET_FOLDER_NAME}' not found in Inbox.")
+        print(f"❌ Error connecting to Outlook: {e}")
         return
 
-    print(f"\nScanning '{target_folder.Name}' for emails between {start_date} and {end_date}...")
+    # 2. Dates
+    start_date = get_valid_date("Enter Start Date (YYYY-MM-DD): ")
+    end_date = get_valid_date("Enter End Date   (YYYY-MM-DD): ")
+    
+    start_dt = datetime.combine(start_date, time.min)
+    end_dt = datetime.combine(end_date, time.max)
+
+    print(f"\nScanning '{TARGET_FOLDER_NAME}' from {start_date} to {end_date}...")
     
     new_data = []
+    messages = target_folder.Items
+    messages.Sort("[ReceivedTime]", True) # Newest first
 
-    # --- 3. PROCESS EMAILS ---
     with tempfile.TemporaryDirectory() as temp_dir:
-        messages = target_folder.Items
-        messages.Sort("[ReceivedTime]", True) # Newest first
-
         for message in messages:
-            if message.Class != 43: continue # Skip non-emails
+            if message.Class != 43: continue
+            
+            try:
+                msg_dt = message.ReceivedTime.replace(tzinfo=None)
+            except: continue
 
-            # Check Date Range
-            msg_date = message.ReceivedTime.date()
-            if not (start_date <= msg_date <= end_date):
-                continue
+            if msg_dt < start_dt: break 
+            if msg_dt > end_dt: continue
 
-            # Check for Excel attachments
-            excel_attachments = [
-                att for att in message.Attachments 
-                if att.FileName.lower().endswith(('.xlsx', '.xls'))
-            ]
+            count = message.Attachments.Count
+            if count == 0: continue
 
-            if not excel_attachments:
-                continue
+            email_has_data = False
+            email_row = {'Subject': message.Subject, 'Date': str(msg_dt.date()), 'md5': [], 'sha1': [], 'sha256': [], 'ip': []}
 
-            # Initialize Row
-            email_row = {
-                'Subject': message.Subject,
-                'Date': str(msg_date),
-                'md5': [], 'sha1': [], 'sha256': [], 'ip': []
-            }
-
-            has_data = False
-
-            for attachment in excel_attachments:
+            # Loop through ALL attachments by index (Fixes the mixed image/excel issue)
+            for i in range(1, count + 1):
                 try:
-                    save_path = os.path.join(temp_dir, attachment.FileName)
-                    attachment.SaveAsFile(save_path)
-                    
-                    # Read Excel
-                    df = pd.read_excel(save_path)
-                    # Normalize headers to lowercase/stripped
-                    df.columns = [str(c).lower().strip() for c in df.columns]
+                    att = message.Attachments.Item(i)
+                    fname = att.FileName.lower()
 
-                    # Extract the fixed columns
-                    for col in IOC_COLUMNS:
-                        # Find column if it contains the keyword (e.g. "ip" matches "src_ip")
-                        found_col = next((c for c in df.columns if col in c), None)
+                    if not fname.endswith(('.xlsx', '.xls')):
+                        continue
+                    
+                    print(f"   📎 Found Excel: {att.FileName} in '{message.Subject}'")
+
+                    save_path = os.path.join(temp_dir, att.FileName)
+                    att.SaveAsFile(save_path)
+                    
+                    xls = pd.ExcelFile(save_path)
+                    
+                    for sheet_name in xls.sheet_names:
+                        df = pd.read_excel(xls, sheet_name=sheet_name)
+                        if df.empty: continue
                         
-                        if found_col:
-                            values = df[found_col].dropna().astype(str).tolist()
-                            if values:
-                                email_row[col].extend(values)
-                                has_data = True
+                        # Find the row with "md-5" or "ip address"
+                        df_clean = find_header_row(df)
+                        
+                        if df_clean is not None:
+                            df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
+                            
+                            for ioc_type, keywords in IOC_SEARCH_TERMS.items():
+                                found_col = None
+                                # Try to match specific keywords (e.g. "md-5")
+                                for kw in keywords:
+                                    found_col = next((c for c in df_clean.columns if kw in c), None)
+                                    if found_col: break
+                                
+                                if found_col:
+                                    vals = df_clean[found_col].dropna().astype(str).tolist()
+                                    if vals:
+                                        email_row[ioc_type].extend(vals)
+                                        email_has_data = True
 
                 except Exception as e:
-                    print(f"⚠️ Error reading attachment in '{message.Subject}': {e}")
+                    print(f"      ⚠️ Error reading attachment: {e}")
 
-            # Aggregate found data
-            if has_data:
-                final_row = {
-                    'Subject': email_row['Subject'],
-                    'Date': email_row['Date']
-                }
-                for col in IOC_COLUMNS:
-                    unique_vals = sorted(list(set(email_row[col])))
-                    final_row[col] = ", ".join(unique_vals)
+            if email_has_data:
+                final_row = {'Subject': email_row['Subject'], 'Date': email_row['Date']}
+                for key in ['md5', 'sha1', 'sha256', 'ip']:
+                    unique_vals = sorted(list(set(email_row[key])))
+                    final_row[key] = ", ".join(unique_vals)
                 
                 new_data.append(final_row)
-                print(f"✅ Found data in: {message.Subject}")
+                print(f"      ✅ Extracted Data.")
 
-    # --- 4. SAVE TO MASTER SHEET ---
     if new_data:
+        print(f"\nWriting {len(new_data)} rows to {MASTER_FILE}...")
         new_df = pd.DataFrame(new_data)
         
         if os.path.exists(MASTER_FILE):
-            print(f"\nAppending to existing file: {MASTER_FILE}")
             try:
-                # Load existing to preserve history
-                existing_df = pd.read_excel(MASTER_FILE)
-                updated_df = pd.concat([existing_df, new_df], ignore_index=True)
-                updated_df.to_excel(MASTER_FILE, index=False)
+                existing = pd.read_excel(MASTER_FILE)
+                updated = pd.concat([existing, new_df], ignore_index=True)
+                updated.to_excel(MASTER_FILE, index=False)
+                print("✅ Done! Data appended.")
             except Exception as e:
-                print(f"❌ Error updating master file. Please close Excel and try again! Error: {e}")
-                return
+                print(f"❌ Error: Close the Excel file! {e}")
         else:
-            print(f"\nCreating new master file: {MASTER_FILE}")
             new_df.to_excel(MASTER_FILE, index=False)
-            
-        print(f"Success! {len(new_data)} emails processed.")
-        # Keep window open if user double-clicked the script
-        input("\nPress Enter to exit...")
+            print("✅ Done! Created new file.")
     else:
-        print("\nNo emails found with Excel attachments in that date range.")
-        input("\nPress Enter to exit...")
+        print("\n❌ No data found.")
+        print("Double check: Do the columns definitely say 'MD-5' and 'IP Address'?")
+
+    input("\nPress Enter to exit...")
 
 if __name__ == "__main__":
-    process_outlook_emails()
+    process_cti_final_fixed()

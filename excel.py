@@ -10,12 +10,15 @@ from datetime import datetime, time as dt_time
 TARGET_FOLDER_NAME = "cti"   
 MASTER_FILE = "Master_IOC_Sheet.xlsx"
 
-# Headers to look for (Lowercase)
+# SEARCH TERMS (Updated)
 IOC_SEARCH_TERMS = {
     'md5': ['md-5', 'md5'],
     'sha1': ['sha-1', 'sha1'],
     'sha256': ['sha-2', 'sha256'],
-    'ip': ['ip address', 'ip_address']
+    # Added "ip's" to catch that specific header
+    'ip': ['ip address', 'ip_address', "ip's", "ips"], 
+    # New Category for Domains
+    'domain': ['domain', 'domains', 'url', 'host'] 
 }
 
 def get_valid_date(prompt_text):
@@ -29,12 +32,10 @@ def find_header_row(df):
     """Scans first 10 rows to find the real header."""
     all_keywords = [item for sublist in IOC_SEARCH_TERMS.values() for item in sublist]
     
-    # Check current headers
     current_cols = [str(c).lower().strip() for c in df.columns]
     if any(k in c for k in all_keywords for c in current_cols):
         return df
 
-    # Scan first 10 rows
     for i, row in df.head(10).iterrows():
         row_values = [str(val).lower().strip() for val in row.values]
         if any(k in val for k in all_keywords for val in row_values):
@@ -43,8 +44,8 @@ def find_header_row(df):
             return df_new
     return None
 
-def process_cti_formatted():
-    print(f"--- Outlook CTI Processor (Formatted) ---")
+def process_cti_final_v3():
+    print(f"--- Outlook CTI Processor (Domains + Formatting) ---")
 
     try:
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -81,12 +82,13 @@ def process_cti_formatted():
             if count == 0: continue
 
             email_has_data = False
-            # Prepare empty lists for this specific email
-            email_row = {'Subject': message.Subject, 'Date': str(msg_dt.date()), 'md5': [], 'sha1': [], 'sha256': [], 'ip': []}
+            # Initialize row with all columns (including domain)
+            email_row = {
+                'Subject': message.Subject, 
+                'Date': str(msg_dt.date()), 
+                'md5': [], 'sha1': [], 'sha256': [], 'ip': [], 'domain': []
+            }
             
-            # Track which files we successfully read
-            files_processed = 0
-
             for i in range(1, count + 1):
                 try:
                     att = message.Attachments.Item(i)
@@ -95,13 +97,12 @@ def process_cti_formatted():
                     if not fname.endswith(('.xlsx', '.xls')):
                         continue
                     
-                    # Unique name to prevent file locking
                     unique_name = f"{uuid.uuid4()}_{att.FileName}"
                     save_path = os.path.join(temp_dir, unique_name)
                     att.SaveAsFile(save_path)
                     time.sleep(0.5) 
                     
-                    file_has_ioc = False # Track if THIS file had data
+                    file_has_ioc = False
                     
                     with pd.ExcelFile(save_path) as xls:
                         for sheet_name in xls.sheet_names:
@@ -116,6 +117,7 @@ def process_cti_formatted():
                                 for ioc_type, keywords in IOC_SEARCH_TERMS.items():
                                     found_col = None
                                     for kw in keywords:
+                                        # Strict matching for "ip's" to avoid issues
                                         found_col = next((c for c in df_clean.columns if kw in c), None)
                                         if found_col: break
                                     
@@ -128,17 +130,16 @@ def process_cti_formatted():
                     
                     if file_has_ioc:
                         print(f"   ✅ Extracted data from: {att.FileName}")
-                        files_processed += 1
                     else:
-                        print(f"   ⚠️ Checked {att.FileName} but found NO matching headers.")
+                        print(f"   ⚠️ Checked {att.FileName} but headers didn't match.")
 
                 except Exception as e:
                     print(f"   ❌ Error reading attachment: {e}")
 
             if email_has_data:
                 final_row = {'Subject': email_row['Subject'], 'Date': email_row['Date']}
-                for key in ['md5', 'sha1', 'sha256', 'ip']:
-                    # JOIN WITH NEWLINE (\n) FOR VERTICAL LIST
+                # Join with Newline for vertical stacking
+                for key in ['md5', 'sha1', 'sha256', 'ip', 'domain']:
                     unique_vals = sorted(list(set(email_row[key])))
                     final_row[key] = "\n".join(unique_vals)
                 
@@ -147,8 +148,6 @@ def process_cti_formatted():
     if new_data:
         print(f"\nWriting {len(new_data)} rows to {MASTER_FILE}...")
         
-        # --- EXCEL SAVING WITH FORMATTING ---
-        # We need to load existing data if it exists
         if os.path.exists(MASTER_FILE):
             try:
                 existing_df = pd.read_excel(MASTER_FILE)
@@ -159,7 +158,7 @@ def process_cti_formatted():
         else:
             final_df = pd.DataFrame(new_data)
 
-        # Use XlsxWriter engine to apply "Wrap Text"
+        # Apply Formatting
         try:
             with pd.ExcelWriter(MASTER_FILE, engine='xlsxwriter') as writer:
                 final_df.to_excel(writer, index=False, sheet_name='IOCs')
@@ -167,23 +166,23 @@ def process_cti_formatted():
                 workbook  = writer.book
                 worksheet = writer.sheets['IOCs']
                 
-                # Define the format: Wrap text + Align Top
                 wrap_format = workbook.add_format({'text_wrap': True, 'valign': 'top'})
                 
-                # Apply format to columns C, D, E, F (Indices 2, 3, 4, 5)
-                # We also set the width to be wider (e.g., 40) so it looks good
-                worksheet.set_column(2, 5, 40, wrap_format)
+                # Format Subject/Date (Columns A-B)
+                worksheet.set_column(0, 1, 20, workbook.add_format({'valign': 'top'}))
                 
-                # Set Subject/Date columns width
-                worksheet.set_column(0, 1, 20)
+                # Format IOC Columns (C-G) -> MD5, SHA1, SHA256, IP, DOMAIN
+                # We set them wide (45) and wrap text
+                worksheet.set_column(2, 6, 45, wrap_format)
 
-            print("✅ Done! Data saved with formatting.")
+            print("✅ Done! Data saved with formatted columns.")
         except Exception as e:
             print(f"❌ Error saving file: {e}")
+            print("   Try running: pip install xlsxwriter")
     else:
         print("\n❌ No data found.")
 
     input("\nPress Enter to exit...")
 
 if __name__ == "__main__":
-    process_cti_formatted()
+    process_cti_final_v3()

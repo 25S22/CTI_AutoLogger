@@ -10,7 +10,7 @@ from datetime import datetime, time as dt_time
 TARGET_FOLDER_NAME = "cti"   
 MASTER_FILE = "Master_IOC_Sheet.xlsx"
 
-# SEARCH TERMS (Matches your specific headers)
+# Headers to look for (Lowercase)
 IOC_SEARCH_TERMS = {
     'md5': ['md-5', 'md5'],
     'sha1': ['sha-1', 'sha1'],
@@ -26,7 +26,7 @@ def get_valid_date(prompt_text):
             print("❌ Invalid format. Use YYYY-MM-DD.")
 
 def find_header_row(df):
-    """Scans for the real header row."""
+    """Scans first 10 rows to find the real header."""
     all_keywords = [item for sublist in IOC_SEARCH_TERMS.values() for item in sublist]
     
     # Check current headers
@@ -38,14 +38,13 @@ def find_header_row(df):
     for i, row in df.head(10).iterrows():
         row_values = [str(val).lower().strip() for val in row.values]
         if any(k in val for k in all_keywords for val in row_values):
-            # Found headers
             df_new = df.iloc[i+1:].copy()
             df_new.columns = row_values
             return df_new
     return None
 
-def process_cti_fixed_permissions():
-    print(f"--- Outlook CTI Processor (Permission Fix) ---")
+def process_cti_formatted():
+    print(f"--- Outlook CTI Processor (Formatted) ---")
 
     try:
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -82,7 +81,11 @@ def process_cti_fixed_permissions():
             if count == 0: continue
 
             email_has_data = False
+            # Prepare empty lists for this specific email
             email_row = {'Subject': message.Subject, 'Date': str(msg_dt.date()), 'md5': [], 'sha1': [], 'sha256': [], 'ip': []}
+            
+            # Track which files we successfully read
+            files_processed = 0
 
             for i in range(1, count + 1):
                 try:
@@ -92,79 +95,95 @@ def process_cti_fixed_permissions():
                     if not fname.endswith(('.xlsx', '.xls')):
                         continue
                     
-                    print(f"   📎 Found Excel: {att.FileName}")
-
-                    # --- FIX 1: UNIQUE FILENAME ---
-                    # We add a random UUID to the filename. 
-                    # This prevents overwriting "IOC.xlsx" with another "IOC.xlsx" (which causes the lock error)
+                    # Unique name to prevent file locking
                     unique_name = f"{uuid.uuid4()}_{att.FileName}"
                     save_path = os.path.join(temp_dir, unique_name)
-                    
                     att.SaveAsFile(save_path)
-                    
-                    # --- FIX 2: TINY SLEEP ---
-                    # Give Windows 0.5 seconds to finish writing/scanning the file before reading it
                     time.sleep(0.5) 
                     
-                    # Use 'with' context to ensure file is closed immediately after reading
-                    try:
-                        with pd.ExcelFile(save_path) as xls:
-                            for sheet_name in xls.sheet_names:
-                                df = pd.read_excel(xls, sheet_name=sheet_name)
-                                if df.empty: continue
+                    file_has_ioc = False # Track if THIS file had data
+                    
+                    with pd.ExcelFile(save_path) as xls:
+                        for sheet_name in xls.sheet_names:
+                            df = pd.read_excel(xls, sheet_name=sheet_name)
+                            if df.empty: continue
+                            
+                            df_clean = find_header_row(df)
+                            
+                            if df_clean is not None:
+                                df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
                                 
-                                df_clean = find_header_row(df)
-                                
-                                if df_clean is not None:
-                                    df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
+                                for ioc_type, keywords in IOC_SEARCH_TERMS.items():
+                                    found_col = None
+                                    for kw in keywords:
+                                        found_col = next((c for c in df_clean.columns if kw in c), None)
+                                        if found_col: break
                                     
-                                    for ioc_type, keywords in IOC_SEARCH_TERMS.items():
-                                        found_col = None
-                                        for kw in keywords:
-                                            found_col = next((c for c in df_clean.columns if kw in c), None)
-                                            if found_col: break
-                                        
-                                        if found_col:
-                                            vals = df_clean[found_col].dropna().astype(str).tolist()
-                                            if vals:
-                                                email_row[ioc_type].extend(vals)
-                                                email_has_data = True
-                    except PermissionError:
-                        print(f"      ⚠️ Still locked. Skipping {att.FileName} (Antivirus might be holding it).")
-                    except Exception as e:
-                        print(f"      ⚠️ Read Error: {e}")
+                                    if found_col:
+                                        vals = df_clean[found_col].dropna().astype(str).tolist()
+                                        if vals:
+                                            email_row[ioc_type].extend(vals)
+                                            file_has_ioc = True
+                                            email_has_data = True
+                    
+                    if file_has_ioc:
+                        print(f"   ✅ Extracted data from: {att.FileName}")
+                        files_processed += 1
+                    else:
+                        print(f"   ⚠️ Checked {att.FileName} but found NO matching headers.")
 
                 except Exception as e:
-                    print(f"      ⚠️ Attachment Error: {e}")
+                    print(f"   ❌ Error reading attachment: {e}")
 
             if email_has_data:
                 final_row = {'Subject': email_row['Subject'], 'Date': email_row['Date']}
                 for key in ['md5', 'sha1', 'sha256', 'ip']:
+                    # JOIN WITH NEWLINE (\n) FOR VERTICAL LIST
                     unique_vals = sorted(list(set(email_row[key])))
-                    final_row[key] = ", ".join(unique_vals)
+                    final_row[key] = "\n".join(unique_vals)
                 
                 new_data.append(final_row)
-                print(f"      ✅ Extracted Data.")
 
     if new_data:
         print(f"\nWriting {len(new_data)} rows to {MASTER_FILE}...")
-        new_df = pd.DataFrame(new_data)
         
+        # --- EXCEL SAVING WITH FORMATTING ---
+        # We need to load existing data if it exists
         if os.path.exists(MASTER_FILE):
             try:
-                existing = pd.read_excel(MASTER_FILE)
-                updated = pd.concat([existing, new_df], ignore_index=True)
-                updated.to_excel(MASTER_FILE, index=False)
-                print("✅ Done! Data appended.")
+                existing_df = pd.read_excel(MASTER_FILE)
+                final_df = pd.concat([existing_df, pd.DataFrame(new_data)], ignore_index=True)
             except Exception as e:
-                print(f"❌ Error: Close the Excel file! {e}")
+                print(f"❌ Error reading existing file: {e}")
+                return
         else:
-            new_df.to_excel(MASTER_FILE, index=False)
-            print("✅ Done! Created new file.")
+            final_df = pd.DataFrame(new_data)
+
+        # Use XlsxWriter engine to apply "Wrap Text"
+        try:
+            with pd.ExcelWriter(MASTER_FILE, engine='xlsxwriter') as writer:
+                final_df.to_excel(writer, index=False, sheet_name='IOCs')
+                
+                workbook  = writer.book
+                worksheet = writer.sheets['IOCs']
+                
+                # Define the format: Wrap text + Align Top
+                wrap_format = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+                
+                # Apply format to columns C, D, E, F (Indices 2, 3, 4, 5)
+                # We also set the width to be wider (e.g., 40) so it looks good
+                worksheet.set_column(2, 5, 40, wrap_format)
+                
+                # Set Subject/Date columns width
+                worksheet.set_column(0, 1, 20)
+
+            print("✅ Done! Data saved with formatting.")
+        except Exception as e:
+            print(f"❌ Error saving file: {e}")
     else:
         print("\n❌ No data found.")
 
     input("\nPress Enter to exit...")
 
 if __name__ == "__main__":
-    process_cti_fixed_permissions()
+    process_cti_formatted()

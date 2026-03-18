@@ -175,7 +175,13 @@ def write_master_file(new_data):
     if os.path.exists(MASTER_FILE):
         try:
             existing_df = pd.read_excel(MASTER_FILE)
-            # Align columns — add missing cols as empty strings
+            # Drop fully blank rows and rows where every IOC column is empty
+            existing_df.dropna(how='all', inplace=True)
+            ioc_cols = ['md5', 'sha1', 'sha256', 'ip', 'domain', 'url', 'email']
+            existing_df = existing_df[existing_df.apply(
+                lambda r: any(str(r.get(c, '')).strip() not in ('', 'nan') for c in ioc_cols),
+                axis=1
+            )]
             for c in col_order:
                 if c not in existing_df.columns:
                     existing_df[c] = ''
@@ -202,8 +208,8 @@ def write_master_file(new_data):
             # ── Formats ────────────────────────────────────────────────────
             header_fmt = wb.add_format({
                 'bold':       True,
-                'bg_color':   '#1F3864',
-                'font_color': '#FFFFFF',
+                'bg_color':   '#FFFF00',
+                'font_color': '#000000',
                 'font_name':  'Arial',
                 'font_size':  10,
                 'border':     1,

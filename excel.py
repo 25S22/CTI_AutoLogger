@@ -257,9 +257,15 @@ def write_master_file(new_data):
             for col_idx, col_name in enumerate(col_order):
                 ws.write(0, col_idx, col_name, header_fmt)
 
-            # ── Row height — auto-fit feels better with wrap; set a minimum ─
-            for row_idx in range(1, len(final_df) + 1):
-                ws.set_row(row_idx, 60)   # 60pt minimum; Excel expands if needed
+            # ── Row heights: calculated per row so every value is visible ─────
+            # Count newlines in each cell to figure out how many lines it needs,
+            # then set the row tall enough to show all of them without expanding.
+            LINE_HEIGHT = 15   # pts per line of text
+            for row_idx, (_, row) in enumerate(final_df.iterrows(), start=1):
+                max_lines = max(
+                    len(str(val).split('\n')) for val in row.values
+                )
+                ws.set_row(row_idx, max_lines * LINE_HEIGHT)
 
             # ── Freeze the header row ───────────────────────────────────────
             ws.freeze_panes(1, 0)

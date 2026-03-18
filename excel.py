@@ -1,59 +1,10 @@
 import win32com.client
 import os
-import re
 import pandas as pd
 import tempfile
 import time
 import uuid
 from datetime import datetime, time as dt_time
-
-# =============================================================================
-#  PER-TYPE VALIDATORS
-#  Each function returns True only if the value looks like a real IOC of that
-#  type.  Junk / description text is silently dropped.
-# =============================================================================
-
-# Pre-compiled patterns used only for validation (not for scanning all cells)
-_IP_RE     = re.compile(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')          # IPv4 / CIDR
-_MD5_RE    = re.compile(r'^[0-9a-fA-F]{32}$')
-_SHA1_RE   = re.compile(r'^[0-9a-fA-F]{40}$')
-_SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
-# Matches normal AND defanged URL prefixes:
-#   https://  |  http://  |  hxxps://  |  hxxp://
-#   hxxps[:]//  |  hxxps[://]  |  http[s]://  |  http[:]//  etc.
-_URL_RE = re.compile(
-    r'^h(?:xx|tt)ps?'           # hxxps / hxxp / https / http
-    r'(?:\[:\]|(?:\[://\])|://)',  # [:]  or  [://]  or  ://
-    re.IGNORECASE
-)
-_EMAIL_RE  = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
-
-def _refang_url(v):
-    """Normalise defanged URL back to a real URL for clean storage."""
-    v = v.strip()
-    v = re.sub(r'^hxxp', 'http', v, flags=re.IGNORECASE)   # hxxp  → http
-    v = re.sub(r'\[:\]', ':', v)                             # [:] → :
-    v = re.sub(r'\[://\]', '://', v)                         # [://] → ://
-    v = re.sub(r'\[:\]//', '://', v)                         # [:]// → ://
-    return v
-
-def _valid_ip(v):     return bool(_IP_RE.match(v.strip()))
-def _valid_md5(v):    return bool(_MD5_RE.match(v.strip()))
-def _valid_sha1(v):   return bool(_SHA1_RE.match(v.strip()))
-def _valid_sha256(v): return bool(_SHA256_RE.match(v.strip()))
-def _valid_url(v):    return bool(_URL_RE.match(v.strip()))
-def _valid_email(v):  return '@' in v and bool(_EMAIL_RE.match(v.strip()))
-def _valid_domain(v): return '.' in v and ' ' not in v.strip() and not _URL_RE.match(v.strip())
-
-IOC_VALIDATORS = {
-    'md5':    _valid_md5,
-    'sha1':   _valid_sha1,
-    'sha256': _valid_sha256,
-    'ip':     _valid_ip,
-    'domain': _valid_domain,
-    'url':    _valid_url,
-    'email':  _valid_email,
-}
 
 # =============================================================================
 #  CONFIGURATION — Edit this section to customise your scan targets
@@ -118,12 +69,7 @@ def find_header_row(df):
 
 
 def extract_iocs_from_df(df_clean, email_row):
-    """
-    Pulls IOC values ONLY from header-matched columns (no free-form cell scanning).
-    Each value is validated against its type before being accepted — this prevents
-    junk text, descriptions, or unrelated content from leaking in.
-    Returns True if any valid IOC was found.
-    """
+    """Copies values straight from header-matched columns — no filtering or validation."""
     found_any = False
     df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
 
@@ -136,16 +82,10 @@ def extract_iocs_from_df(df_clean, email_row):
         if not found_col:
             continue
 
-        raw_vals = df_clean[found_col].dropna().astype(str).str.strip().tolist()
-        validator = IOC_VALIDATORS[ioc_type]
-
-        valid_vals = [
-            _refang_url(v) if ioc_type == 'url' else v
-            for v in raw_vals
-            if v and v.lower() not in ('nan', 'none', '') and validator(v)
-        ]
-        if valid_vals:
-            email_row[ioc_type].extend(valid_vals)
+        vals = df_clean[found_col].dropna().astype(str).str.strip().tolist()
+        vals = [v for v in vals if v and v.lower() not in ('nan', 'none', '')]
+        if vals:
+            email_row[ioc_type].extend(vals)
             found_any = True
 
     return found_any
@@ -196,15 +136,13 @@ def process_message(message, temp_dir, new_data, label_source):
             file_has_ioc = False
 
             with pd.ExcelFile(save_path) as xls:
-                for sheet_name in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=sheet_name)
-                    if df.empty:
-                        continue
-                    df_clean = find_header_row(df)
-                    if df_clean is not None:
-                        if extract_iocs_from_df(df_clean, email_row):
-                            file_has_ioc   = True
-                            email_has_data = True
+                    df = pd.read_excel(xls, sheet_name=0)   # first sheet only
+                    if not df.empty:
+                        df_clean = find_header_row(df)
+                        if df_clean is not None:
+                            if extract_iocs_from_df(df_clean, email_row):
+                                file_has_ioc   = True
+                                email_has_data = True
 
             status = "✅  Extracted" if file_has_ioc else "⚠️   No matching headers in"
             print(f"   {status}: {att.FileName}")

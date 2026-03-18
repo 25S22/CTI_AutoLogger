@@ -1,188 +1,398 @@
 import win32com.client
 import os
+import re
 import pandas as pd
 import tempfile
 import time
 import uuid
 from datetime import datetime, time as dt_time
 
-# --- CONFIGURATION ---
-TARGET_FOLDER_NAME = "cti"   
+# =============================================================================
+#  CONFIGURATION — Edit this section to customise your scan targets
+# =============================================================================
+
+# List of Outlook folder names (inside Inbox) to scan.
+# Leave empty [] to skip folder-based scanning.
+TARGET_FOLDERS = [
+    "cti",
+    # "threat-intel",   # <-- Add more folder names here
+]
+
+# List of sender email addresses to scan across your ENTIRE inbox.
+# Any email from these senders (regardless of folder) will be checked.
+# Leave empty [] to skip sender-based scanning.
+TARGET_SENDERS = [
+    # "analyst@threatfeed.com",
+    # "reports@isac.org",        # <-- Add sender emails here
+]
+
+# Output master file
 MASTER_FILE = "Master_IOC_Sheet.xlsx"
 
-# SEARCH TERMS (Updated)
+# IOC column headers to look for inside Excel attachments
 IOC_SEARCH_TERMS = {
-    'md5': ['md-5', 'md5'],
-    'sha1': ['sha-1', 'sha1'],
+    'md5':    ['md-5', 'md5'],
+    'sha1':   ['sha-1', 'sha1'],
     'sha256': ['sha-2', 'sha256'],
-    # Added "ip's" to catch that specific header
-    'ip': ['ip address', 'ip_address', "ip's", "ips"], 
-    # New Category for Domains
-    'domain': ['domain', 'domains', 'url', 'host'] 
+    'ip':     ['ip address', 'ip_address', "ip's", "ips"],
+    'domain': ['domain', 'domains', 'host'],
+    'url':    ['url', 'urls', 'link', 'links', 'uri'],
+    'email':  ['email', 'e-mail', 'emails', 'mail', 'sender', 'recipient'],
 }
+
+# =============================================================================
+#  HELPERS
+# =============================================================================
+
+# Regex patterns for inline extraction (from cell values, not headers)
+_URL_PATTERN   = re.compile(r'https?://[^\s,;"\'\]>]+', re.IGNORECASE)
+_EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.IGNORECASE)
+
 
 def get_valid_date(prompt_text):
     while True:
         try:
             return datetime.strptime(input(prompt_text).strip(), "%Y-%m-%d").date()
         except ValueError:
-            print("❌ Invalid format. Use YYYY-MM-DD.")
+            print("❌  Invalid format. Use YYYY-MM-DD.")
+
 
 def find_header_row(df):
-    """Scans first 10 rows to find the real header."""
-    all_keywords = [item for sublist in IOC_SEARCH_TERMS.values() for item in sublist]
-    
+    """Scans first 10 rows to locate the real header row."""
+    all_keywords = [kw for kwlist in IOC_SEARCH_TERMS.values() for kw in kwlist]
+
     current_cols = [str(c).lower().strip() for c in df.columns]
     if any(k in c for k in all_keywords for c in current_cols):
         return df
 
     for i, row in df.head(10).iterrows():
-        row_values = [str(val).lower().strip() for val in row.values]
-        if any(k in val for k in all_keywords for val in row_values):
-            df_new = df.iloc[i+1:].copy()
+        row_values = [str(v).lower().strip() for v in row.values]
+        if any(k in v for k in all_keywords for v in row_values):
+            df_new = df.iloc[i + 1:].copy()
             df_new.columns = row_values
             return df_new
     return None
 
-def process_cti_final_v3():
-    print(f"--- Outlook CTI Processor (Domains + Formatting) ---")
 
+def extract_iocs_from_df(df_clean, email_row):
+    """
+    Pulls IOC values from a cleaned DataFrame.
+    - Header-matched columns  → stored in their typed bucket.
+    - Every cell              → also scanned for inline URLs and email addresses.
+    Returns True if any IOC was found.
+    """
+    found_any = False
+    df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
+
+    # --- Header-matched extraction ---
+    for ioc_type, keywords in IOC_SEARCH_TERMS.items():
+        found_col = None
+        for kw in keywords:
+            found_col = next((c for c in df_clean.columns if kw in c), None)
+            if found_col:
+                break
+        if found_col:
+            vals = df_clean[found_col].dropna().astype(str).str.strip().tolist()
+            vals = [v for v in vals if v and v.lower() not in ('nan', 'none', '')]
+            if vals:
+                email_row[ioc_type].extend(vals)
+                found_any = True
+
+    # --- Inline regex scan across ALL cells ---
+    for col in df_clean.columns:
+        for cell_val in df_clean[col].dropna().astype(str):
+            urls_found   = _URL_PATTERN.findall(cell_val)
+            emails_found = _EMAIL_PATTERN.findall(cell_val)
+            if urls_found:
+                email_row['url'].extend(urls_found)
+                found_any = True
+            if emails_found:
+                email_row['email'].extend(emails_found)
+                found_any = True
+
+    return found_any
+
+
+def process_message(message, temp_dir, new_data, label_source):
+    """
+    Inspects a single Outlook message for Excel attachments and extracts IOCs.
+    `label_source` is a string like 'Folder: cti' or 'Sender: x@y.com' shown in output.
+    """
     try:
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        inbox = outlook.GetDefaultFolder(6)
-        target_folder = inbox.Folders(TARGET_FOLDER_NAME)
-    except Exception as e:
-        print(f"❌ Error connecting: {e}")
+        msg_dt = message.ReceivedTime.replace(tzinfo=None)
+    except Exception:
         return
 
-    start_date = get_valid_date("Enter Start Date (YYYY-MM-DD): ")
-    end_date = get_valid_date("Enter End Date   (YYYY-MM-DD): ")
-    
-    start_dt = datetime.combine(start_date, dt_time.min)
-    end_dt = datetime.combine(end_date, dt_time.max)
+    count = message.Attachments.Count
+    if count == 0:
+        return
 
-    print(f"\nScanning '{TARGET_FOLDER_NAME}'...")
-    
+    sender_name  = getattr(message, 'SenderName', 'Unknown')
+    sender_email = getattr(message, 'SenderEmailAddress', 'Unknown')
+
+    email_row = {
+        'Subject':      message.Subject,
+        'Date':         str(msg_dt.date()),
+        'Sender Name':  sender_name,
+        'Sender Email': sender_email,
+        'Source':       label_source,
+        'md5': [], 'sha1': [], 'sha256': [],
+        'ip': [], 'domain': [], 'url': [], 'email': [],
+    }
+
+    email_has_data = False
+
+    for i in range(1, count + 1):
+        try:
+            att      = message.Attachments.Item(i)
+            fname    = att.FileName.lower()
+
+            if not fname.endswith(('.xlsx', '.xls')):
+                continue
+
+            unique_name = f"{uuid.uuid4()}_{att.FileName}"
+            save_path   = os.path.join(temp_dir, unique_name)
+            att.SaveAsFile(save_path)
+            time.sleep(0.4)
+
+            file_has_ioc = False
+
+            with pd.ExcelFile(save_path) as xls:
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name)
+                    if df.empty:
+                        continue
+                    df_clean = find_header_row(df)
+                    if df_clean is not None:
+                        if extract_iocs_from_df(df_clean, email_row):
+                            file_has_ioc   = True
+                            email_has_data = True
+
+            status = "✅  Extracted" if file_has_ioc else "⚠️   No matching headers in"
+            print(f"   {status}: {att.FileName}")
+
+        except Exception as e:
+            print(f"   ❌  Error reading attachment: {e}")
+
+    if email_has_data:
+        final_row = {
+            'Subject':      email_row['Subject'],
+            'Date':         email_row['Date'],
+            'Sender Name':  email_row['Sender Name'],
+            'Sender Email': email_row['Sender Email'],
+            'Source':       email_row['Source'],
+        }
+        for key in ['md5', 'sha1', 'sha256', 'ip', 'domain', 'url', 'email']:
+            unique_vals        = sorted(set(email_row[key]))
+            final_row[key]     = "\n".join(unique_vals)
+        new_data.append(final_row)
+
+
+def write_master_file(new_data):
+    """Appends new_data to the master Excel file with full wrap-text formatting."""
+
+    col_order = ['Subject', 'Date', 'Sender Name', 'Sender Email', 'Source',
+                 'md5', 'sha1', 'sha256', 'ip', 'domain', 'url', 'email']
+
+    new_df = pd.DataFrame(new_data, columns=col_order)
+
+    if os.path.exists(MASTER_FILE):
+        try:
+            existing_df = pd.read_excel(MASTER_FILE)
+            # Align columns — add missing cols as empty strings
+            for c in col_order:
+                if c not in existing_df.columns:
+                    existing_df[c] = ''
+            final_df = pd.concat([existing_df[col_order], new_df], ignore_index=True)
+        except Exception as e:
+            print(f"❌  Error reading existing master file: {e}")
+            return
+    else:
+        final_df = new_df
+
+    try:
+        with pd.ExcelWriter(MASTER_FILE, engine='xlsxwriter') as writer:
+            final_df.to_excel(writer, index=False, sheet_name='IOCs')
+
+            wb  = writer.book
+            ws  = writer.sheets['IOCs']
+
+            # ── Formats ────────────────────────────────────────────────────
+            header_fmt = wb.add_format({
+                'bold':       True,
+                'bg_color':   '#1F3864',
+                'font_color': '#FFFFFF',
+                'font_name':  'Arial',
+                'font_size':  10,
+                'border':     1,
+                'align':      'center',
+                'valign':     'vcenter',
+                'text_wrap':  True,
+            })
+            meta_fmt = wb.add_format({
+                'font_name': 'Arial',
+                'font_size': 9,
+                'valign':    'top',
+                'border':    1,
+                'text_wrap': True,
+            })
+            ioc_fmt = wb.add_format({
+                'font_name': 'Courier New',
+                'font_size': 9,
+                'valign':    'top',
+                'border':    1,
+                'text_wrap': True,
+            })
+            url_fmt = wb.add_format({
+                'font_name':  'Courier New',
+                'font_size':  9,
+                'valign':     'top',
+                'border':     1,
+                'text_wrap':  True,
+                'font_color': '#0563C1',  # hyperlink blue
+            })
+
+            # ── Column widths & formats ─────────────────────────────────────
+            col_config = {
+                # col_index : (width, fmt)
+                0:  (30, meta_fmt),   # Subject
+                1:  (12, meta_fmt),   # Date
+                2:  (20, meta_fmt),   # Sender Name
+                3:  (28, meta_fmt),   # Sender Email
+                4:  (18, meta_fmt),   # Source
+                5:  (36, ioc_fmt),    # md5
+                6:  (42, ioc_fmt),    # sha1
+                7:  (66, ioc_fmt),    # sha256
+                8:  (18, ioc_fmt),    # ip
+                9:  (30, ioc_fmt),    # domain
+                10: (55, url_fmt),    # url
+                11: (35, ioc_fmt),    # email
+            }
+            for idx, (width, fmt) in col_config.items():
+                ws.set_column(idx, idx, width, fmt)
+
+            # ── Write header row with custom format ─────────────────────────
+            for col_idx, col_name in enumerate(col_order):
+                ws.write(0, col_idx, col_name, header_fmt)
+
+            # ── Row height — auto-fit feels better with wrap; set a minimum ─
+            for row_idx in range(1, len(final_df) + 1):
+                ws.set_row(row_idx, 60)   # 60pt minimum; Excel expands if needed
+
+            # ── Freeze the header row ───────────────────────────────────────
+            ws.freeze_panes(1, 0)
+
+            # ── Auto-filter on header ───────────────────────────────────────
+            ws.autofilter(0, 0, len(final_df), len(col_order) - 1)
+
+        print(f"✅  Done! {len(new_data)} new row(s) saved → {MASTER_FILE}")
+
+    except Exception as e:
+        print(f"❌  Error saving file: {e}")
+        print("    Try: pip install xlsxwriter")
+
+
+# =============================================================================
+#  MAIN
+# =============================================================================
+
+def process_cti():
+    print("=" * 60)
+    print("  Outlook CTI Processor  —  Multi-Source Edition")
+    print("=" * 60)
+
+    if not TARGET_FOLDERS and not TARGET_SENDERS:
+        print("❌  No TARGET_FOLDERS or TARGET_SENDERS configured. Edit the script.")
+        return
+
+    # ── Connect to Outlook ────────────────────────────────────────────────
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        inbox   = outlook.GetDefaultFolder(6)
+    except Exception as e:
+        print(f"❌  Could not connect to Outlook: {e}")
+        return
+
+    # ── Date range ────────────────────────────────────────────────────────
+    start_date = get_valid_date("Enter Start Date (YYYY-MM-DD): ")
+    end_date   = get_valid_date("Enter End Date   (YYYY-MM-DD): ")
+    start_dt   = datetime.combine(start_date, dt_time.min)
+    end_dt     = datetime.combine(end_date,   dt_time.max)
+
     new_data = []
-    messages = target_folder.Items
-    messages.Sort("[ReceivedTime]", True) 
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        for message in messages:
-            if message.Class != 43: continue
-            
+
+        # ── Scan configured folders ───────────────────────────────────────
+        for folder_name in TARGET_FOLDERS:
+            print(f"\n📁  Scanning folder: '{folder_name}'")
             try:
-                msg_dt = message.ReceivedTime.replace(tzinfo=None)
-            except: continue
-
-            if msg_dt < start_dt: break 
-            if msg_dt > end_dt: continue
-
-            count = message.Attachments.Count
-            if count == 0: continue
-
-            email_has_data = False
-            # Initialize row with all columns (including domain)
-            email_row = {
-                'Subject': message.Subject, 
-                'Date': str(msg_dt.date()), 
-                'md5': [], 'sha1': [], 'sha256': [], 'ip': [], 'domain': []
-            }
-            
-            for i in range(1, count + 1):
-                try:
-                    att = message.Attachments.Item(i)
-                    fname = att.FileName.lower()
-
-                    if not fname.endswith(('.xlsx', '.xls')):
-                        continue
-                    
-                    unique_name = f"{uuid.uuid4()}_{att.FileName}"
-                    save_path = os.path.join(temp_dir, unique_name)
-                    att.SaveAsFile(save_path)
-                    time.sleep(0.5) 
-                    
-                    file_has_ioc = False
-                    
-                    with pd.ExcelFile(save_path) as xls:
-                        for sheet_name in xls.sheet_names:
-                            df = pd.read_excel(xls, sheet_name=sheet_name)
-                            if df.empty: continue
-                            
-                            df_clean = find_header_row(df)
-                            
-                            if df_clean is not None:
-                                df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
-                                
-                                for ioc_type, keywords in IOC_SEARCH_TERMS.items():
-                                    found_col = None
-                                    for kw in keywords:
-                                        # Strict matching for "ip's" to avoid issues
-                                        found_col = next((c for c in df_clean.columns if kw in c), None)
-                                        if found_col: break
-                                    
-                                    if found_col:
-                                        vals = df_clean[found_col].dropna().astype(str).tolist()
-                                        if vals:
-                                            email_row[ioc_type].extend(vals)
-                                            file_has_ioc = True
-                                            email_has_data = True
-                    
-                    if file_has_ioc:
-                        print(f"   ✅ Extracted data from: {att.FileName}")
-                    else:
-                        print(f"   ⚠️ Checked {att.FileName} but headers didn't match.")
-
-                except Exception as e:
-                    print(f"   ❌ Error reading attachment: {e}")
-
-            if email_has_data:
-                final_row = {'Subject': email_row['Subject'], 'Date': email_row['Date']}
-                # Join with Newline for vertical stacking
-                for key in ['md5', 'sha1', 'sha256', 'ip', 'domain']:
-                    unique_vals = sorted(list(set(email_row[key])))
-                    final_row[key] = "\n".join(unique_vals)
-                
-                new_data.append(final_row)
-
-    if new_data:
-        print(f"\nWriting {len(new_data)} rows to {MASTER_FILE}...")
-        
-        if os.path.exists(MASTER_FILE):
-            try:
-                existing_df = pd.read_excel(MASTER_FILE)
-                final_df = pd.concat([existing_df, pd.DataFrame(new_data)], ignore_index=True)
+                folder   = inbox.Folders(folder_name)
+                messages = folder.Items
+                messages.Sort("[ReceivedTime]", True)
             except Exception as e:
-                print(f"❌ Error reading existing file: {e}")
-                return
-        else:
-            final_df = pd.DataFrame(new_data)
+                print(f"   ❌  Could not open folder '{folder_name}': {e}")
+                continue
 
-        # Apply Formatting
-        try:
-            with pd.ExcelWriter(MASTER_FILE, engine='xlsxwriter') as writer:
-                final_df.to_excel(writer, index=False, sheet_name='IOCs')
-                
-                workbook  = writer.book
-                worksheet = writer.sheets['IOCs']
-                
-                wrap_format = workbook.add_format({'text_wrap': True, 'valign': 'top'})
-                
-                # Format Subject/Date (Columns A-B)
-                worksheet.set_column(0, 1, 20, workbook.add_format({'valign': 'top'}))
-                
-                # Format IOC Columns (C-G) -> MD5, SHA1, SHA256, IP, DOMAIN
-                # We set them wide (45) and wrap text
-                worksheet.set_column(2, 6, 45, wrap_format)
+            for message in messages:
+                if message.Class != 43:
+                    continue
+                try:
+                    msg_dt = message.ReceivedTime.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if msg_dt < start_dt:
+                    break
+                if msg_dt > end_dt:
+                    continue
 
-            print("✅ Done! Data saved with formatted columns.")
-        except Exception as e:
-            print(f"❌ Error saving file: {e}")
-            print("   Try running: pip install xlsxwriter")
+                print(f"   📧  {msg_dt.date()} | {message.Subject[:60]}")
+                process_message(message, temp_dir, new_data, f"Folder: {folder_name}")
+
+        # ── Scan inbox for messages from specific senders ─────────────────
+        for sender_email in TARGET_SENDERS:
+            print(f"\n👤  Scanning for sender: '{sender_email}'")
+            messages = inbox.Items
+            # Use Outlook DASL filter for performance
+            filter_str = (
+                f"@SQL=\"urn:schemas:httpmail:fromemail\" = '{sender_email}'"
+            )
+            try:
+                filtered = messages.Restrict(filter_str)
+                filtered.Sort("[ReceivedTime]", True)
+            except Exception:
+                # Fallback: iterate manually
+                filtered = messages
+
+            for message in filtered:
+                if message.Class != 43:
+                    continue
+                try:
+                    msg_dt = message.ReceivedTime.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if msg_dt < start_dt:
+                    break
+                if msg_dt > end_dt:
+                    continue
+
+                # Confirm sender match (needed for fallback path)
+                msg_sender = getattr(message, 'SenderEmailAddress', '').lower()
+                if sender_email.lower() not in msg_sender:
+                    continue
+
+                print(f"   📧  {msg_dt.date()} | {message.Subject[:60]}")
+                process_message(message, temp_dir, new_data, f"Sender: {sender_email}")
+
+    # ── Write results ─────────────────────────────────────────────────────
+    if new_data:
+        print(f"\n💾  Writing {len(new_data)} row(s) to {MASTER_FILE}…")
+        write_master_file(new_data)
     else:
-        print("\n❌ No data found.")
+        print("\n⚠️   No IOC data found in the specified date range.")
 
-    input("\nPress Enter to exit...")
+    input("\nPress Enter to exit…")
+
 
 if __name__ == "__main__":
-    process_cti_final_v3()
+    process_cti()

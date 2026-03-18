@@ -8,6 +8,54 @@ import uuid
 from datetime import datetime, time as dt_time
 
 # =============================================================================
+#  PER-TYPE VALIDATORS
+#  Each function returns True only if the value looks like a real IOC of that
+#  type.  Junk / description text is silently dropped.
+# =============================================================================
+
+# Pre-compiled patterns used only for validation (not for scanning all cells)
+_IP_RE     = re.compile(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')          # IPv4 / CIDR
+_MD5_RE    = re.compile(r'^[0-9a-fA-F]{32}$')
+_SHA1_RE   = re.compile(r'^[0-9a-fA-F]{40}$')
+_SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
+# Matches normal AND defanged URL prefixes:
+#   https://  |  http://  |  hxxps://  |  hxxp://
+#   hxxps[:]//  |  hxxps[://]  |  http[s]://  |  http[:]//  etc.
+_URL_RE = re.compile(
+    r'^h(?:xx|tt)ps?'           # hxxps / hxxp / https / http
+    r'(?:\[:\]|(?:\[://\])|://)',  # [:]  or  [://]  or  ://
+    re.IGNORECASE
+)
+_EMAIL_RE  = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+def _refang_url(v):
+    """Normalise defanged URL back to a real URL for clean storage."""
+    v = v.strip()
+    v = re.sub(r'^hxxp', 'http', v, flags=re.IGNORECASE)   # hxxp  → http
+    v = re.sub(r'\[:\]', ':', v)                             # [:] → :
+    v = re.sub(r'\[://\]', '://', v)                         # [://] → ://
+    v = re.sub(r'\[:\]//', '://', v)                         # [:]// → ://
+    return v
+
+def _valid_ip(v):     return bool(_IP_RE.match(v.strip()))
+def _valid_md5(v):    return bool(_MD5_RE.match(v.strip()))
+def _valid_sha1(v):   return bool(_SHA1_RE.match(v.strip()))
+def _valid_sha256(v): return bool(_SHA256_RE.match(v.strip()))
+def _valid_url(v):    return bool(_URL_RE.match(v.strip()))
+def _valid_email(v):  return '@' in v and bool(_EMAIL_RE.match(v.strip()))
+def _valid_domain(v): return '.' in v and ' ' not in v.strip() and not _URL_RE.match(v.strip())
+
+IOC_VALIDATORS = {
+    'md5':    _valid_md5,
+    'sha1':   _valid_sha1,
+    'sha256': _valid_sha256,
+    'ip':     _valid_ip,
+    'domain': _valid_domain,
+    'url':    _valid_url,
+    'email':  _valid_email,
+}
+
+# =============================================================================
 #  CONFIGURATION — Edit this section to customise your scan targets
 # =============================================================================
 
@@ -44,11 +92,6 @@ IOC_SEARCH_TERMS = {
 #  HELPERS
 # =============================================================================
 
-# Regex patterns for inline extraction (from cell values, not headers)
-_URL_PATTERN   = re.compile(r'https?://[^\s,;"\'\]>]+', re.IGNORECASE)
-_EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.IGNORECASE)
-
-
 def get_valid_date(prompt_text):
     while True:
         try:
@@ -76,39 +119,34 @@ def find_header_row(df):
 
 def extract_iocs_from_df(df_clean, email_row):
     """
-    Pulls IOC values from a cleaned DataFrame.
-    - Header-matched columns  → stored in their typed bucket.
-    - Every cell              → also scanned for inline URLs and email addresses.
-    Returns True if any IOC was found.
+    Pulls IOC values ONLY from header-matched columns (no free-form cell scanning).
+    Each value is validated against its type before being accepted — this prevents
+    junk text, descriptions, or unrelated content from leaking in.
+    Returns True if any valid IOC was found.
     """
     found_any = False
     df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
 
-    # --- Header-matched extraction ---
     for ioc_type, keywords in IOC_SEARCH_TERMS.items():
         found_col = None
         for kw in keywords:
             found_col = next((c for c in df_clean.columns if kw in c), None)
             if found_col:
                 break
-        if found_col:
-            vals = df_clean[found_col].dropna().astype(str).str.strip().tolist()
-            vals = [v for v in vals if v and v.lower() not in ('nan', 'none', '')]
-            if vals:
-                email_row[ioc_type].extend(vals)
-                found_any = True
+        if not found_col:
+            continue
 
-    # --- Inline regex scan across ALL cells ---
-    for col in df_clean.columns:
-        for cell_val in df_clean[col].dropna().astype(str):
-            urls_found   = _URL_PATTERN.findall(cell_val)
-            emails_found = _EMAIL_PATTERN.findall(cell_val)
-            if urls_found:
-                email_row['url'].extend(urls_found)
-                found_any = True
-            if emails_found:
-                email_row['email'].extend(emails_found)
-                found_any = True
+        raw_vals = df_clean[found_col].dropna().astype(str).str.strip().tolist()
+        validator = IOC_VALIDATORS[ioc_type]
+
+        valid_vals = [
+            _refang_url(v) if ioc_type == 'url' else v
+            for v in raw_vals
+            if v and v.lower() not in ('nan', 'none', '') and validator(v)
+        ]
+        if valid_vals:
+            email_row[ioc_type].extend(valid_vals)
+            found_any = True
 
     return found_any
 
@@ -209,6 +247,12 @@ def write_master_file(new_data):
             return
     else:
         final_df = new_df
+
+    # Sort oldest → newest before writing
+    final_df['Date'] = pd.to_datetime(final_df['Date'], errors='coerce')
+    final_df.sort_values('Date', ascending=True, inplace=True)
+    final_df['Date'] = final_df['Date'].dt.strftime('%Y-%m-%d')
+    final_df.reset_index(drop=True, inplace=True)
 
     try:
         with pd.ExcelWriter(MASTER_FILE, engine='xlsxwriter') as writer:
